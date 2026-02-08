@@ -171,7 +171,7 @@ func run() int {
 		}
 
 		sentAt := time.Now()
-		logf("sent message %d/%d", messageIndex+1, len(messages))
+		logf("sent message %d/%d: %q", messageIndex+1, len(messages), message)
 		messageIndex = (messageIndex + 1) % len(messages)
 		nextSend = nextScheduledSend(nextSend, timeout, sentAt)
 	}
