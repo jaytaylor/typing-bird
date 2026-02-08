@@ -1,8 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	defaultTimeout = 30 * time.Second
-	defaultDelay   = 15 * time.Millisecond
-	enterKey       = "Enter"
+	defaultTimeout     = 30 * time.Second
+	defaultDelay       = 15 * time.Millisecond
+	defaultIdleSamples = 5
+	enterKey           = "Enter"
 )
 
 func main() {
@@ -138,31 +139,37 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sendTarget := session
-	if trimmed := strings.TrimSpace(targetPaneValue); trimmed != "" {
-		sendTarget = trimmed
+	sendTarget := strings.TrimSpace(targetPaneValue)
+	if sendTarget == "" {
+		resolved, err := tmuxPreferredSendPaneForSession(session)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed resolving target pane for session %q: %v\n", session, err)
+			return 1
+		}
+		sendTarget = resolved
 	}
 
 	logf(
-		"session=%q send-target=%q timeout=%s delay=%s messages=%d",
+		"session=%q send-target=%q idle-timeout=%s delay=%s messages=%d",
 		session, sendTarget, timeout, delay, len(messages),
 	)
 	if len(args) == 1 {
 		logf("no messages supplied; sending newline only each timeout")
 	}
 
-	nextSend := time.Now().Add(timeout)
 	messageIndex := 0
 
 	for {
-		if err := waitUntil(ctx, nextSend); err != nil {
-			if errors.Is(err, context.Canceled) {
+		baseLen, err := waitForTargetIdle(ctx, sendTarget, defaultIdleSamples, timeout)
+		if err != nil {
+			if err == context.Canceled {
 				logf("shutdown signal received, exiting")
 				return 0
 			}
-			fmt.Fprintf(os.Stderr, "ERROR: wait failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "ERROR: idle wait failed for target %q in session %q: %v\n", sendTarget, session, err)
 			return 1
 		}
+		logf("idle detected on %q: sample1=%d bytes", sendTarget, baseLen)
 
 		message := messages[messageIndex]
 		if err := tmuxSendMessage(sendTarget, message, delay); err != nil {
@@ -170,10 +177,8 @@ func run() int {
 			return 1
 		}
 
-		sentAt := time.Now()
 		logf("sent message %d/%d: %q", messageIndex+1, len(messages), message)
 		messageIndex = (messageIndex + 1) % len(messages)
-		nextSend = nextScheduledSend(nextSend, timeout, sentAt)
 	}
 }
 
@@ -194,14 +199,94 @@ func parseDuration(raw, name string, requirePositive bool) (time.Duration, error
 	return value, nil
 }
 
-func waitUntil(ctx context.Context, target time.Time) error {
-	wait := time.Until(target)
-	if wait <= 0 {
+func tmuxSessionExists(session string) error {
+	cmd := exec.Command("tmux", "has-session", "-t", session)
+	return cmd.Run()
+}
+
+func tmuxCaptureTarget(target string) ([]byte, error) {
+	cmd := exec.Command("tmux", "capture-pane", "-p", "-t", target)
+	return cmd.Output()
+}
+
+func waitForTargetIdle(ctx context.Context, target string, samples int, duration time.Duration) (int, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, context.Canceled
+		default:
+		}
+
+		allEqual, baseLen, diffsBase, diffsPrev, err := idleSamplesTarget(ctx, target, samples, duration)
+		if err != nil {
+			if err == context.Canceled {
+				return 0, context.Canceled
+			}
+			if ok, _ := tmuxTargetExists(target); !ok {
+				return 0, fmt.Errorf("tmux target %q no longer exists", target)
+			}
+			if sleepErr := sleepWithContext(ctx, 200*time.Millisecond); sleepErr != nil {
+				return 0, sleepErr
+			}
+			continue
+		}
+		if allEqual {
+			return baseLen, nil
+		}
+		logf("not idle yet on %q; %s", target, formatIdleDifferences(diffsBase, diffsPrev))
+	}
+}
+
+// idleSamplesTarget mirrors idle-latch sampling: capture N times across total duration.
+func idleSamplesTarget(ctx context.Context, target string, samples int, duration time.Duration) (bool, int, []int, []int, error) {
+	if samples < 1 {
+		return false, 0, nil, nil, fmt.Errorf("samples must be >= 1")
+	}
+	var interval time.Duration
+	if samples > 1 {
+		interval = time.Duration(int64(duration) / int64(samples-1))
+	}
+
+	caps := make([][]byte, 0, samples)
+	for i := 0; i < samples; i++ {
+		select {
+		case <-ctx.Done():
+			return false, 0, nil, nil, context.Canceled
+		default:
+		}
+
+		b, err := tmuxCaptureTarget(target)
+		if err != nil {
+			return false, 0, nil, nil, err
+		}
+		caps = append(caps, b)
+		if i < samples-1 && interval > 0 {
+			if err := sleepWithContext(ctx, interval); err != nil {
+				return false, 0, nil, nil, err
+			}
+		}
+	}
+
+	base := caps[0]
+	allEqual := true
+	diffsFromBase := make([]int, samples)
+	diffsFromPrev := make([]int, samples)
+	for i := 1; i < samples; i++ {
+		if !bytes.Equal(base, caps[i]) {
+			allEqual = false
+		}
+		diffsFromBase[i] = byteDiffCount(base, caps[i])
+		diffsFromPrev[i] = byteDiffCount(caps[i-1], caps[i])
+	}
+	return allEqual, len(base), diffsFromBase, diffsFromPrev, nil
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
 		return nil
 	}
-	timer := time.NewTimer(wait)
+	timer := time.NewTimer(d)
 	defer timer.Stop()
-
 	select {
 	case <-ctx.Done():
 		return context.Canceled
@@ -210,17 +295,50 @@ func waitUntil(ctx context.Context, target time.Time) error {
 	}
 }
 
-func nextScheduledSend(previous time.Time, interval time.Duration, sentAt time.Time) time.Time {
-	next := previous.Add(interval)
-	for !next.After(sentAt) {
-		next = next.Add(interval)
+func tmuxTargetExists(target string) (bool, error) {
+	cmd := exec.Command("tmux", "display-message", "-p", "-t", target, "#{pane_id}")
+	if err := cmd.Run(); err != nil {
+		return false, err
 	}
-	return next
+	return true, nil
 }
 
-func tmuxSessionExists(session string) error {
-	cmd := exec.Command("tmux", "has-session", "-t", session)
-	return cmd.Run()
+func byteDiffCount(a, b []byte) int {
+	min := len(a)
+	if len(b) < min {
+		min = len(b)
+	}
+	diffs := 0
+	for i := 0; i < min; i++ {
+		if a[i] != b[i] {
+			diffs++
+		}
+	}
+	diffs += abs(len(a) - len(b))
+	return diffs
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func formatIdleDifferences(diffsBase, diffsPrev []int) string {
+	var b strings.Builder
+	b.WriteString("differences relative to sample 1: ")
+	first := true
+	for i := 1; i < len(diffsBase); i++ {
+		if diffsBase[i] != 0 {
+			if !first {
+				b.WriteString(", ")
+			}
+			first = false
+			fmt.Fprintf(&b, "sample %d: base=%d prev=%d", i+1, diffsBase[i], diffsPrev[i])
+		}
+	}
+	return b.String()
 }
 
 func tmuxRestartExistingBirdPanes(session, currentPane, commandName string) (bool, error) {
