@@ -109,7 +109,7 @@ func TestByteDiffCount(t *testing.T) {
 }
 
 func TestBuildChildArgsOmitsInjectFlagAndIncludesTargetPane(t *testing.T) {
-	got := buildChildArgs(30*time.Second, 15*time.Millisecond, "foobar", []string{"m1", "m2"}, "%123")
+	got := buildChildArgs(30*time.Second, 15*time.Millisecond, "foobar", []string{"m1", "m2"}, "%123", false)
 	want := []string{"-t", "30s", "-d", "15ms", "--target-pane", "%123", "foobar", "m1", "m2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildChildArgs(...) = %#v; want %#v", got, want)
@@ -118,6 +118,14 @@ func TestBuildChildArgsOmitsInjectFlagAndIncludesTargetPane(t *testing.T) {
 		if arg == "-i" || arg == "--inject" || strings.HasPrefix(arg, "--inject=") {
 			t.Fatalf("buildChildArgs included inject flag unexpectedly: %#v", got)
 		}
+	}
+}
+
+func TestBuildChildArgsIncludesVerboseWhenEnabled(t *testing.T) {
+	got := buildChildArgs(30*time.Second, 15*time.Millisecond, "foobar", []string{"m1"}, "%123", true)
+	want := []string{"-t", "30s", "-d", "15ms", "--verbose", "--target-pane", "%123", "foobar", "m1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildChildArgs(...) = %#v; want %#v", got, want)
 	}
 }
 
