@@ -99,16 +99,12 @@ func TestMessageSendActions(t *testing.T) {
 	}
 }
 
-func TestNextScheduledSendAccountsForSendDelay(t *testing.T) {
-	base := time.Unix(0, 0).UTC()
-	interval := 30 * time.Second
-	previous := base.Add(interval)
-	sentAt := base.Add(95 * time.Second)
-
-	got := nextScheduledSend(previous, interval, sentAt)
-	want := base.Add(120 * time.Second)
-	if !got.Equal(want) {
-		t.Fatalf("nextScheduledSend(...) = %s; want %s", got, want)
+func TestByteDiffCount(t *testing.T) {
+	a := []byte("abcdef")
+	b := []byte("abcXefghi")
+	got := byteDiffCount(a, b)
+	if got != 4 {
+		t.Fatalf("byteDiffCount(...) = %d; want %d", got, 4)
 	}
 }
 
@@ -191,5 +187,13 @@ func TestPickPreferredSendPaneFallsBackToFirstNonInjected(t *testing.T) {
 	got := pickPreferredSendPane(raw)
 	if got != "%3" {
 		t.Fatalf("pickPreferredSendPane(...) = %q; want %q", got, "%3")
+	}
+}
+
+func TestFormatIdleDifferences(t *testing.T) {
+	got := formatIdleDifferences([]int{0, 2, 0, 4}, []int{0, 1, 0, 3})
+	want := "differences relative to sample 1: sample 2: base=2 prev=1, sample 4: base=4 prev=3"
+	if got != want {
+		t.Fatalf("formatIdleDifferences(...) = %q; want %q", got, want)
 	}
 }
