@@ -26,6 +26,8 @@ func main() {
 func run() int {
 	timeoutValue := defaultTimeout.String()
 	delayValue := defaultDelay.String()
+	inject := false
+	targetPaneValue := ""
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s -t|--timeout <duration> <tmux-session-name> [messages-list ...]\n", os.Args[0])
@@ -36,17 +38,23 @@ func run() int {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
 		fmt.Fprintf(flag.CommandLine.Output(), "  -t, --timeout         idle timeout between sends (default: %s)\n", defaultTimeout)
 		fmt.Fprintf(flag.CommandLine.Output(), "  -d, --delay           key input delay duration (default: %s)\n", defaultDelay)
+		fmt.Fprintln(flag.CommandLine.Output(), "  -i, --inject          inject into target session as bottom 5-line pane")
 		fmt.Fprintln(flag.CommandLine.Output(), "")
 		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -t 30m foobar message1 message2 message3\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s --timeout 45s foobar\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -t 1m -d 25ms foobar \"line1\\nline2\"\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s -i foobar message1 message2\n", os.Args[0])
 	}
 
 	flag.StringVar(&timeoutValue, "t", timeoutValue, "idle timeout between sends (e.g. 30s, 15m, 1h)")
 	flag.StringVar(&timeoutValue, "timeout", timeoutValue, "idle timeout between sends (e.g. 30s, 15m, 1h)")
 	flag.StringVar(&delayValue, "d", delayValue, "key input delay duration")
 	flag.StringVar(&delayValue, "delay", delayValue, "key input delay duration")
+	flag.BoolVar(&inject, "i", false, "inject as a detached bottom pane in the target session")
+	flag.BoolVar(&inject, "inject", false, "inject as a detached bottom pane in the target session")
+	// Internal flag used by injected child process to target the original pane.
+	flag.StringVar(&targetPaneValue, "target-pane", "", "internal pane target for send-keys")
 	flag.Parse()
 
 	timeout, err := parseDuration(timeoutValue, "timeout", true)
@@ -58,6 +66,10 @@ func run() int {
 	delay, err := parseDuration(delayValue, "delay", false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		return 2
+	}
+	if inject && strings.TrimSpace(targetPaneValue) != "" {
+		fmt.Fprintln(os.Stderr, "ERROR: inject mode cannot be combined with --target-pane")
 		return 2
 	}
 
@@ -81,13 +93,43 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "ERROR: tmux session %q not available: %v\n", session, err)
 		return 1
 	}
+	if inject {
+		sendTargetPane, err := resolveInjectionSendTarget(session)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed resolving injection target pane for session %q: %v\n", session, err)
+			return 1
+		}
+		exePath, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed locating executable path: %v\n", err)
+			return 1
+		}
+
+		childArgs := buildChildArgs(timeout, delay, session, messages, sendTargetPane)
+		childCommand := shellCommandForExec(exePath, childArgs)
+		injectedPaneID, err := tmuxInjectBottomPane(sendTargetPane, childCommand)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed injecting pane into session %q: %v\n", session, err)
+			return 1
+		}
+		logf(
+			"injected pane=%q target-pane=%q session=%q timeout=%s delay=%s messages=%d",
+			injectedPaneID, sendTargetPane, session, timeout, delay, len(messages),
+		)
+		return 0
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	sendTarget := session
+	if trimmed := strings.TrimSpace(targetPaneValue); trimmed != "" {
+		sendTarget = trimmed
+	}
+
 	logf(
-		"session=%q timeout=%s delay=%s messages=%d",
-		session, timeout, delay, len(messages),
+		"session=%q send-target=%q timeout=%s delay=%s messages=%d",
+		session, sendTarget, timeout, delay, len(messages),
 	)
 	if len(args) == 1 {
 		logf("no messages supplied; sending newline only each timeout")
@@ -107,8 +149,8 @@ func run() int {
 		}
 
 		message := messages[messageIndex]
-		if err := tmuxSendMessage(session, message, delay); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: failed sending message #%d to session %q: %v\n", messageIndex+1, session, err)
+		if err := tmuxSendMessage(sendTarget, message, delay); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed sending message #%d to target %q in session %q: %v\n", messageIndex+1, sendTarget, session, err)
 			return 1
 		}
 
@@ -165,15 +207,93 @@ func tmuxSessionExists(session string) error {
 	return cmd.Run()
 }
 
-func tmuxSendMessage(session, message string, keyDelay time.Duration) error {
+func resolveInjectionSendTarget(session string) (string, error) {
+	if pane := strings.TrimSpace(os.Getenv("TMUX_PANE")); pane != "" {
+		belongs, err := tmuxPaneBelongsToSession(pane, session)
+		if err == nil && belongs {
+			return pane, nil
+		}
+	}
+	return tmuxActivePaneForSession(session)
+}
+
+func tmuxPaneBelongsToSession(paneID, session string) (bool, error) {
+	out, err := exec.Command("tmux", "display-message", "-p", "-t", paneID, "#{session_name}").Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) == session, nil
+}
+
+func tmuxActivePaneForSession(session string) (string, error) {
+	out, err := exec.Command("tmux", "display-message", "-p", "-t", session, "#{pane_id}").Output()
+	if err != nil {
+		return "", err
+	}
+	pane := strings.TrimSpace(string(out))
+	if pane == "" {
+		return "", fmt.Errorf("tmux returned empty pane id")
+	}
+	return pane, nil
+}
+
+func buildChildArgs(timeout, delay time.Duration, session string, messages []string, targetPane string) []string {
+	args := []string{"-t", timeout.String(), "-d", delay.String()}
+	if strings.TrimSpace(targetPane) != "" {
+		args = append(args, "--target-pane", targetPane)
+	}
+	args = append(args, session)
+	args = append(args, messages...)
+	return args
+}
+
+func shellCommandForExec(executable string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, shellQuoteSingle(executable))
+	for _, arg := range args {
+		parts = append(parts, shellQuoteSingle(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func tmuxSplitBottomPaneArgs(targetPane, shellCommand string) []string {
+	return []string{
+		"split-window",
+		"-v",
+		"-d",
+		"-l",
+		"5",
+		"-P",
+		"-F",
+		"#{pane_id}",
+		"-t",
+		targetPane,
+		shellCommand,
+	}
+}
+
+func tmuxInjectBottomPane(targetPane, shellCommand string) (string, error) {
+	cmdArgs := tmuxSplitBottomPaneArgs(targetPane, shellCommand)
+	out, err := exec.Command("tmux", cmdArgs...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	paneID := strings.TrimSpace(string(out))
+	if paneID == "" {
+		return "", fmt.Errorf("tmux split-window returned empty pane id")
+	}
+	return paneID, nil
+}
+
+func tmuxSendMessage(target, message string, keyDelay time.Duration) error {
 	for _, action := range messageSendActions(message, enterKey) {
 		if action.literal {
-			if err := tmuxSendLiteral(session, action.value); err != nil {
+			if err := tmuxSendLiteral(target, action.value); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := tmuxSendKey(session, action.value, keyDelay); err != nil {
+		if err := tmuxSendKey(target, action.value, keyDelay); err != nil {
 			return err
 		}
 	}
