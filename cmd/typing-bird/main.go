@@ -21,6 +21,8 @@ const (
 	enterKey           = "Enter"
 )
 
+var verboseLogging bool
+
 func main() {
 	os.Exit(run())
 }
@@ -30,6 +32,7 @@ func run() int {
 	delayValue := defaultDelay.String()
 	inject := false
 	targetPaneValue := ""
+	verbose := false
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s -t|--timeout <duration> <tmux-session-name> [messages-list ...]\n", os.Args[0])
@@ -40,6 +43,7 @@ func run() int {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
 		fmt.Fprintf(flag.CommandLine.Output(), "  -t, --timeout         terminal-idle timeout window before next send (default: %s)\n", defaultTimeout)
 		fmt.Fprintf(flag.CommandLine.Output(), "  -d, --delay           key input delay duration (default: %s)\n", defaultDelay)
+		fmt.Fprintln(flag.CommandLine.Output(), "  -v, --verbose         enable debug logging")
 		fmt.Fprintln(flag.CommandLine.Output(), "  -i, --inject          inject into target session as bottom 5-line pane")
 		fmt.Fprintln(flag.CommandLine.Output(), "")
 		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
@@ -53,11 +57,14 @@ func run() int {
 	flag.StringVar(&timeoutValue, "timeout", timeoutValue, "terminal-idle timeout window before next send (e.g. 30s, 15m, 1h)")
 	flag.StringVar(&delayValue, "d", delayValue, "key input delay duration")
 	flag.StringVar(&delayValue, "delay", delayValue, "key input delay duration")
+	flag.BoolVar(&verbose, "v", false, "enable debug logging")
+	flag.BoolVar(&verbose, "verbose", false, "enable debug logging")
 	flag.BoolVar(&inject, "i", false, "inject as a detached bottom pane in the target session")
 	flag.BoolVar(&inject, "inject", false, "inject as a detached bottom pane in the target session")
 	// Internal flag used by injected child process to target the original pane.
 	flag.StringVar(&targetPaneValue, "target-pane", "", "internal pane target for send-keys")
 	flag.Parse()
+	verboseLogging = verbose
 
 	timeout, err := parseDuration(timeoutValue, "timeout", true)
 	if err != nil {
@@ -115,7 +122,7 @@ func run() int {
 			return 1
 		}
 
-		childArgs := buildChildArgs(timeout, delay, session, messages, sendTargetPane)
+		childArgs := buildChildArgs(timeout, delay, session, messages, sendTargetPane, verbose)
 		childCommand := shellCommandForExec(exePath, childArgs)
 		injectedPaneID, err := tmuxInjectBottomPane(sendTargetPane, childCommand)
 		if err != nil {
@@ -233,7 +240,7 @@ func waitForTargetIdle(ctx context.Context, target string, samples int, duration
 		if allEqual {
 			return baseLen, nil
 		}
-		logf("not idle yet on %q; %s", target, formatIdleDifferences(diffsBase, diffsPrev))
+		debugf("not idle yet on %q; %s", target, formatIdleDifferences(diffsBase, diffsPrev))
 	}
 }
 
@@ -470,8 +477,11 @@ func tmuxActivePaneForSession(session string) (string, error) {
 	return pane, nil
 }
 
-func buildChildArgs(timeout, delay time.Duration, session string, messages []string, targetPane string) []string {
+func buildChildArgs(timeout, delay time.Duration, session string, messages []string, targetPane string, verbose bool) []string {
 	args := []string{"-t", timeout.String(), "-d", delay.String()}
+	if verbose {
+		args = append(args, "--verbose")
+	}
 	if strings.TrimSpace(targetPane) != "" {
 		args = append(args, "--target-pane", targetPane)
 	}
@@ -630,4 +640,14 @@ func logf(format string, args ...any) {
 	all = append(all, time.Now().Format(time.RFC3339))
 	all = append(all, args...)
 	fmt.Fprintf(os.Stderr, "[%s] INFO: "+format+"\n", all...)
+}
+
+func debugf(format string, args ...any) {
+	if !verboseLogging {
+		return
+	}
+	all := make([]any, 0, len(args)+1)
+	all = append(all, time.Now().Format(time.RFC3339))
+	all = append(all, args...)
+	fmt.Fprintf(os.Stderr, "[%s] DEBUG: "+format+"\n", all...)
 }
