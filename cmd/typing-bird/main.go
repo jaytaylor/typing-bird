@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -32,11 +33,11 @@ func run() int {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s -t|--timeout <duration> <tmux-session-name> [messages-list ...]\n", os.Args[0])
 		fmt.Fprintln(flag.CommandLine.Output(), "")
-		fmt.Fprintln(flag.CommandLine.Output(), "Periodically sends the next message to a tmux session after idle timeout,")
+		fmt.Fprintln(flag.CommandLine.Output(), "Periodically sends the next message to a tmux session after terminal-idle timeout,")
 		fmt.Fprintln(flag.CommandLine.Output(), "appending a newline/Enter and cycling back to the first message.")
 		fmt.Fprintln(flag.CommandLine.Output(), "")
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
-		fmt.Fprintf(flag.CommandLine.Output(), "  -t, --timeout         idle timeout between sends (default: %s)\n", defaultTimeout)
+		fmt.Fprintf(flag.CommandLine.Output(), "  -t, --timeout         terminal-idle timeout window before next send (default: %s)\n", defaultTimeout)
 		fmt.Fprintf(flag.CommandLine.Output(), "  -d, --delay           key input delay duration (default: %s)\n", defaultDelay)
 		fmt.Fprintln(flag.CommandLine.Output(), "  -i, --inject          inject into target session as bottom 5-line pane")
 		fmt.Fprintln(flag.CommandLine.Output(), "")
@@ -47,8 +48,8 @@ func run() int {
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s -i foobar message1 message2\n", os.Args[0])
 	}
 
-	flag.StringVar(&timeoutValue, "t", timeoutValue, "idle timeout between sends (e.g. 30s, 15m, 1h)")
-	flag.StringVar(&timeoutValue, "timeout", timeoutValue, "idle timeout between sends (e.g. 30s, 15m, 1h)")
+	flag.StringVar(&timeoutValue, "t", timeoutValue, "terminal-idle timeout window before next send (e.g. 30s, 15m, 1h)")
+	flag.StringVar(&timeoutValue, "timeout", timeoutValue, "terminal-idle timeout window before next send (e.g. 30s, 15m, 1h)")
 	flag.StringVar(&delayValue, "d", delayValue, "key input delay duration")
 	flag.StringVar(&delayValue, "delay", delayValue, "key input delay duration")
 	flag.BoolVar(&inject, "i", false, "inject as a detached bottom pane in the target session")
@@ -94,14 +95,22 @@ func run() int {
 		return 1
 	}
 	if inject {
-		sendTargetPane, err := resolveInjectionSendTarget(session)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: failed resolving injection target pane for session %q: %v\n", session, err)
-			return 1
-		}
 		exePath, err := os.Executable()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: failed locating executable path: %v\n", err)
+			return 1
+		}
+		exeBase := filepath.Base(exePath)
+		currentPane := strings.TrimSpace(os.Getenv("TMUX_PANE"))
+		skippedCurrentPane, err := tmuxRestartExistingBirdPanes(session, currentPane, exeBase)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed restarting existing typing-bird panes in session %q: %v\n", session, err)
+			return 1
+		}
+
+		sendTargetPane, err := resolveInjectionSendTarget(session)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed resolving injection target pane for session %q: %v\n", session, err)
 			return 1
 		}
 
@@ -111,6 +120,13 @@ func run() int {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: failed injecting pane into session %q: %v\n", session, err)
 			return 1
+		}
+		if err := tmuxMarkInjectedPane(injectedPaneID, sendTargetPane); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed marking injected pane %q: %v\n", injectedPaneID, err)
+			return 1
+		}
+		if skippedCurrentPane && currentPane != "" {
+			_ = tmuxKillPane(currentPane)
 		}
 		logf(
 			"injected pane=%q target-pane=%q session=%q timeout=%s delay=%s messages=%d",
@@ -207,14 +223,113 @@ func tmuxSessionExists(session string) error {
 	return cmd.Run()
 }
 
+func tmuxRestartExistingBirdPanes(session, currentPane, commandName string) (bool, error) {
+	out, err := exec.Command("tmux", "list-panes", "-t", session, "-F", "#{pane_id}\t#{@typing_bird_injected}\t#{pane_current_command}").Output()
+	if err != nil {
+		return false, err
+	}
+	panes := parseBirdPaneIDs(string(out), commandName)
+	skippedCurrent := false
+	for _, paneID := range panes {
+		if paneID == currentPane && currentPane != "" {
+			skippedCurrent = true
+			continue
+		}
+		_ = tmuxSendKey(paneID, "C-c", 0)
+		time.Sleep(150 * time.Millisecond)
+		_ = tmuxKillPane(paneID)
+	}
+	return skippedCurrent, nil
+}
+
+func parseBirdPaneIDs(raw, commandName string) []string {
+	lines := strings.Split(raw, "\n")
+	seen := make(map[string]struct{})
+	panes := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		paneID := strings.TrimSpace(parts[0])
+		injectedFlag := strings.TrimSpace(parts[1])
+		currentCommand := strings.TrimSpace(parts[2])
+		if paneID == "" {
+			continue
+		}
+		if injectedFlag != "1" && currentCommand != commandName && currentCommand != "typing-bird" {
+			continue
+		}
+		if _, exists := seen[paneID]; exists {
+			continue
+		}
+		seen[paneID] = struct{}{}
+		panes = append(panes, paneID)
+	}
+	return panes
+}
+
 func resolveInjectionSendTarget(session string) (string, error) {
 	if pane := strings.TrimSpace(os.Getenv("TMUX_PANE")); pane != "" {
 		belongs, err := tmuxPaneBelongsToSession(pane, session)
 		if err == nil && belongs {
-			return pane, nil
+			injected, injErr := tmuxPaneIsInjected(pane)
+			if injErr == nil && !injected {
+				return pane, nil
+			}
 		}
 	}
-	return tmuxActivePaneForSession(session)
+	return tmuxPreferredSendPaneForSession(session)
+}
+
+func tmuxPaneIsInjected(paneID string) (bool, error) {
+	out, err := exec.Command("tmux", "display-message", "-p", "-t", paneID, "#{@typing_bird_injected}").Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) == "1", nil
+}
+
+func tmuxPreferredSendPaneForSession(session string) (string, error) {
+	out, err := exec.Command("tmux", "list-panes", "-t", session, "-F", "#{pane_id}\t#{pane_active}\t#{@typing_bird_injected}").Output()
+	if err != nil {
+		return "", err
+	}
+	pane := pickPreferredSendPane(string(out))
+	if pane != "" {
+		return pane, nil
+	}
+	return "", fmt.Errorf("no non-injected pane found in session")
+}
+
+func pickPreferredSendPane(raw string) string {
+	lines := strings.Split(raw, "\n")
+	firstNonInjected := ""
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		paneID := strings.TrimSpace(parts[0])
+		active := strings.TrimSpace(parts[1])
+		injected := strings.TrimSpace(parts[2]) == "1"
+		if paneID == "" || injected {
+			continue
+		}
+		if active == "1" {
+			return paneID
+		}
+		if firstNonInjected == "" {
+			firstNonInjected = paneID
+		}
+	}
+	return firstNonInjected
 }
 
 func tmuxPaneBelongsToSession(paneID, session string) (bool, error) {
@@ -283,6 +398,20 @@ func tmuxInjectBottomPane(targetPane, shellCommand string) (string, error) {
 		return "", fmt.Errorf("tmux split-window returned empty pane id")
 	}
 	return paneID, nil
+}
+
+func tmuxMarkInjectedPane(paneID, sendTargetPane string) error {
+	if err := exec.Command("tmux", "set-option", "-p", "-t", paneID, "@typing_bird_injected", "1").Run(); err != nil {
+		return err
+	}
+	if err := exec.Command("tmux", "set-option", "-p", "-t", paneID, "@typing_bird_send_target", sendTargetPane).Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func tmuxKillPane(paneID string) error {
+	return exec.Command("tmux", "kill-pane", "-t", paneID).Run()
 }
 
 func tmuxSendMessage(target, message string, keyDelay time.Duration) error {

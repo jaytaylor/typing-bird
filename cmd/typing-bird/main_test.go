@@ -152,3 +152,44 @@ func TestTmuxSplitBottomPaneArgsLayoutAndHeight(t *testing.T) {
 		t.Fatalf("tmuxSplitBottomPaneArgs(...) = %#v; want %#v", got, want)
 	}
 }
+
+func TestParseBirdPaneIDs(t *testing.T) {
+	raw := strings.Join([]string{
+		"%1\t1\tbash",
+		"%2\t\ttyping-bird",
+		"%3\t\tvim",
+		"%4\t\t" + "typing-bird",
+		"",
+	}, "\n")
+	got := parseBirdPaneIDs(raw, "typing-bird")
+	want := []string{"%1", "%2", "%4"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseBirdPaneIDs(...) = %#v; want %#v", got, want)
+	}
+}
+
+func TestPickPreferredSendPane(t *testing.T) {
+	raw := strings.Join([]string{
+		"%9\t0\t1",
+		"%2\t1\t",
+		"%3\t0\t",
+		"",
+	}, "\n")
+	got := pickPreferredSendPane(raw)
+	if got != "%2" {
+		t.Fatalf("pickPreferredSendPane(...) = %q; want %q", got, "%2")
+	}
+}
+
+func TestPickPreferredSendPaneFallsBackToFirstNonInjected(t *testing.T) {
+	raw := strings.Join([]string{
+		"%9\t1\t1",
+		"%3\t0\t",
+		"%2\t0\t",
+		"",
+	}, "\n")
+	got := pickPreferredSendPane(raw)
+	if got != "%3" {
+		t.Fatalf("pickPreferredSendPane(...) = %q; want %q", got, "%3")
+	}
+}
