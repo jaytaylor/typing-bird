@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -108,5 +109,46 @@ func TestNextScheduledSendAccountsForSendDelay(t *testing.T) {
 	want := base.Add(120 * time.Second)
 	if !got.Equal(want) {
 		t.Fatalf("nextScheduledSend(...) = %s; want %s", got, want)
+	}
+}
+
+func TestBuildChildArgsOmitsInjectFlagAndIncludesTargetPane(t *testing.T) {
+	got := buildChildArgs(30*time.Second, 15*time.Millisecond, "foobar", []string{"m1", "m2"}, "%123")
+	want := []string{"-t", "30s", "-d", "15ms", "--target-pane", "%123", "foobar", "m1", "m2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildChildArgs(...) = %#v; want %#v", got, want)
+	}
+	for _, arg := range got {
+		if arg == "-i" || arg == "--inject" || strings.HasPrefix(arg, "--inject=") {
+			t.Fatalf("buildChildArgs included inject flag unexpectedly: %#v", got)
+		}
+	}
+}
+
+func TestShellCommandForExecQuotesArguments(t *testing.T) {
+	got := shellCommandForExec("/tmp/typing-bird", []string{"-t", "30s", "foo bar", "a'b"})
+	want := "'/tmp/typing-bird' '-t' '30s' 'foo bar' 'a'\\''b'"
+	if got != want {
+		t.Fatalf("shellCommandForExec(...) = %q; want %q", got, want)
+	}
+}
+
+func TestTmuxSplitBottomPaneArgsLayoutAndHeight(t *testing.T) {
+	got := tmuxSplitBottomPaneArgs("%3", "'/bin/typing-bird' '-t' '30s' 'foo'")
+	want := []string{
+		"split-window",
+		"-v",
+		"-d",
+		"-l",
+		"5",
+		"-P",
+		"-F",
+		"#{pane_id}",
+		"-t",
+		"%3",
+		"'/bin/typing-bird' '-t' '30s' 'foo'",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("tmuxSplitBottomPaneArgs(...) = %#v; want %#v", got, want)
 	}
 }
