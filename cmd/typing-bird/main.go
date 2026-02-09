@@ -176,7 +176,7 @@ func run() int {
 			fmt.Fprintf(os.Stderr, "ERROR: idle wait failed for target %q in session %q: %v\n", sendTarget, session, err)
 			return 1
 		}
-		logf("idle detected on %q: sample1=%d bytes", sendTarget, baseLen)
+		logf("idle detected on pane-id=%q: sample1=%d bytes", sendTarget, baseLen)
 
 		message := messages[messageIndex]
 		if err := tmuxSendMessage(sendTarget, message, delay); err != nil {
