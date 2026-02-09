@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,7 @@ const (
 	defaultTimeout     = 30 * time.Second
 	defaultDelay       = 15 * time.Millisecond
 	defaultIdleSamples = 5
+	interruptWindow    = 5 * time.Second
 	enterKey           = "Enter"
 )
 
@@ -143,8 +145,12 @@ func run() int {
 		return 0
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	launchCommand := buildLaunchCommand(os.Args)
+	interruptCode := atomic.Int32{}
+	stopInterrupts := installInterruptHandlers(cancel, launchCommand, interruptWindow, &interruptCode)
+	defer stopInterrupts()
 
 	sendTarget := strings.TrimSpace(targetPaneValue)
 	if sendTarget == "" {
@@ -170,6 +176,10 @@ func run() int {
 		baseLen, err := waitForTargetIdle(ctx, sendTarget, defaultIdleSamples, timeout)
 		if err != nil {
 			if err == context.Canceled {
+				code := interruptCode.Load()
+				if code != 0 {
+					return int(code)
+				}
 				logf("shutdown signal received, exiting")
 				return 0
 			}
@@ -488,6 +498,61 @@ func buildChildArgs(timeout, delay time.Duration, session string, messages []str
 	args = append(args, session)
 	args = append(args, messages...)
 	return args
+}
+
+func buildLaunchCommand(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, shellQuoteSingle(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func installInterruptHandlers(cancel context.CancelFunc, launchCommand string, window time.Duration, exitCode *atomic.Int32) (stop func()) {
+	c := make(chan os.Signal, 2)
+	done := make(chan struct{})
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	var last time.Time
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case sig, ok := <-c:
+				if !ok {
+					return
+				}
+				now := time.Now()
+				if sig == syscall.SIGTERM {
+					fmt.Fprintf(os.Stderr, "[%s] INFO: SIGTERM received; exiting.\n", now.Format(time.RFC3339))
+					exitCode.Store(143)
+					cancel()
+					return
+				}
+				if !last.IsZero() && now.Sub(last) <= window {
+					fmt.Fprintf(os.Stderr, "[%s] INFO: Second Ctrl-C within %s; exiting.\n", now.Format(time.RFC3339), window)
+					exitCode.Store(130)
+					cancel()
+					return
+				}
+				fmt.Fprintf(os.Stderr, "[%s] INFO: Ctrl-C received; restart with:\n", now.Format(time.RFC3339))
+				if launchCommand != "" {
+					fmt.Fprintf(os.Stderr, "$ %s\n", launchCommand)
+				} else {
+					fmt.Fprintln(os.Stderr, "$ <unknown command>")
+				}
+				fmt.Fprintf(os.Stderr, "[%s] INFO: Press Ctrl-C again within %s to exit.\n", time.Now().Format(time.RFC3339), window)
+				last = now
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(c)
+		close(done)
+	}
 }
 
 func shellCommandForExec(executable string, args []string) string {
